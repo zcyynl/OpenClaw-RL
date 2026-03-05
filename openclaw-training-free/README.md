@@ -1,12 +1,12 @@
-# Training-Free GRPO
+# Training-Free
 
-**Training-Free GRPO** is a lightweight, zero-GPU reinforcement learning approach for LLMs. Instead of updating model parameters (as in standard RL or [OPD](https://github.com/Gen-Verse/OpenClaw-RL)), it intercepts conversations, uses a Judge LLM to extract *improvement hints* from user follow-ups, and stores those hints in a keyword-indexed experience library. On future requests the system automatically retrieves and injects relevant past experiences into the prompt — giving the base model accumulated "wisdom" at $0 training cost.
+**Training-Free ** is a lightweight, zero-GPU reinforcement learning approach for LLMs. Instead of updating model parameters (as in standard RL or [OPD](https://github.com/Gen-Verse/OpenClaw-RL)), it intercepts conversations, uses a Judge LLM to extract *improvement hints* from user follow-ups, and stores those hints in a keyword-indexed experience library. On future requests the system automatically retrieves and injects relevant past experiences into the prompt — giving the base model accumulated "wisdom" at $0 training cost.
 
 ## How It Works
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                      Training-Free GRPO                      │
+│                      Training-Free                       │
 ├──────────────────────────────────────────────────────────────┤
 │                                                              │
 │  Step 1 — INTERCEPT                                          │
