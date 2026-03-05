@@ -1,14 +1,16 @@
 """
-Training-Free GRPO API Server
+ExpLoop API Server — Training-Free Experience Loop
 
 Proxies requests to a real LLM, intercepts conversations, and
 asynchronously collects experience hints for future prompt injection.
+No model parameters are ever updated — all improvement comes from
+accumulated experience injected at prompt time.
 
 Usage::
 
     UPSTREAM_BASE_URL=https://api.openai.com \\
     UPSTREAM_API_KEY=sk-xxx \\
-    python openclaw_tf_server.py
+    python exploop_server.py
 
 The server exposes an OpenAI-compatible ``/v1/chat/completions``
 endpoint.  Point any client at ``http://localhost:8080`` and chat
@@ -18,6 +20,7 @@ normally — experience accumulation happens transparently.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +48,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-logger = logging.getLogger("tf-server")
+logger = logging.getLogger("exploop-server")
 
 # ---------------------------------------------------------------------------
 # Configuration (from environment)
@@ -85,6 +88,9 @@ extractor = ExperienceExtractor(
 injector = PromptInjector(store=store)
 
 # session_id → list of {"role": ..., "content": ...}
+# NOTE: conversation history is held in memory only and lost on restart.
+# This is by design — the persistent artefact is the experience store,
+# not the raw conversation log.
 conversation_history: dict[str, list[dict[str, str]]] = (
     defaultdict(list)
 )
@@ -151,7 +157,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Start the background hint-extraction worker on startup."""
     worker_task = asyncio.create_task(_hint_worker())
     logger.info(
-        "[server] Training-Free GRPO server starting on port %d", PORT,
+        "[server] ExpLoop server starting on port %d", PORT,
     )
     logger.info(
         "[server] upstream=%s  judge=%s  store=%s  top_k=%d",
@@ -168,8 +174,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(
-    title="Training-Free GRPO Proxy",
-    version="0.1.0",
+    title="ExpLoop — Training-Free Experience Loop",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -178,21 +184,41 @@ app = FastAPI(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_session_id(body: dict[str, Any]) -> str:
-    """Derive a session id from the request body.
+def _resolve_session_id(body: dict[str, Any], request: Request) -> str:
+    """Derive a session id from the request body or connection metadata.
 
-    Uses ``session_id`` or ``user`` field if present, otherwise
-    generates a new UUID.
+    Priority:
+    1. Explicit ``session_id`` field in the request body.
+    2. ``user`` field in the request body (OpenAI convention).
+    3. ``Authorization`` header (hashed) — stable per API key.
+    4. Client IP address — stable per network origin.
+    5. Random UUID (last resort, but should rarely be reached now).
+
+    BUG FIX: the original code fell through to a random UUID when the
+    body lacked ``session_id``/``user``, which meant the same client
+    would get a new session on every request and lose conversation
+    continuity.
     """
-    return str(
-        body.get("session_id")
-        or body.get("user")
-        or uuid.uuid4().hex[:12]
-    )
+    sid = body.get("session_id") or body.get("user")
+    if sid:
+        return str(sid)
+
+    # Use Authorization header hash as a stable session key.
+    auth = request.headers.get("authorization", "")
+    if auth:
+        return "auth-" + hashlib.sha256(auth.encode()).hexdigest()[:16]
+
+    # Fall back to client IP.
+    client_ip = request.client.host if request.client else ""
+    if client_ip:
+        return "ip-" + client_ip
+
+    # Absolute last resort.
+    return uuid.uuid4().hex[:12]
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
-    """Return the content of the last user message."""
+    """Return the content of the last user message, or empty string."""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             return str(msg.get("content", ""))
@@ -210,30 +236,20 @@ def _upstream_headers() -> dict[str, str]:
 # Streaming proxy
 # ---------------------------------------------------------------------------
 
-async def _stream_upstream(
-    payload: dict[str, Any],
-) -> AsyncGenerator[bytes, None]:
-    """Yield raw SSE chunks from the upstream LLM."""
-    url = f"{UPSTREAM_BASE_URL}/v1/chat/completions"
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream(
-            "POST", url,
-            json=payload,
-            headers=_upstream_headers(),
-        ) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-
-
 async def _collect_streaming_content(
     payload: dict[str, Any],
 ) -> tuple[AsyncGenerator[bytes, None], asyncio.Future[str]]:
     """Return a streaming generator AND a future that resolves to
     the full assistant content once the stream is consumed.
 
-    We tee the stream: yield each chunk to the client while
-    accumulating delta content tokens.
+    We tee the stream: pass raw bytes to the client (preserving SSE
+    framing) while also parsing delta content tokens.
+
+    BUG FIX: the original implementation used ``aiter_lines()`` and
+    re-appended a single ``\\n``, which could corrupt SSE framing
+    (events are delimited by ``\\n\\n``).  We now use ``aiter_bytes()``
+    for the pass-through path and parse the accumulated buffer
+    separately for content extraction.
     """
     loop = asyncio.get_running_loop()
     content_future: asyncio.Future[str] = loop.create_future()
@@ -241,6 +257,7 @@ async def _collect_streaming_content(
 
     async def _gen() -> AsyncGenerator[bytes, None]:
         url = f"{UPSTREAM_BASE_URL}/v1/chat/completions"
+        line_buffer = b""
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream(
@@ -249,25 +266,36 @@ async def _collect_streaming_content(
                     headers=_upstream_headers(),
                 ) as resp:
                     resp.raise_for_status()
-                    async for chunk in resp.aiter_lines():
-                        line = chunk.strip()
-                        yield (chunk + "\n").encode()
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            continue
-                        try:
-                            obj = json.loads(data_str)
-                            delta = (
-                                obj.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content", "")
+                    async for raw_chunk in resp.aiter_bytes():
+                        # Pass raw bytes to client unchanged (preserves
+                        # SSE double-newline framing).
+                        yield raw_chunk
+
+                        # Accumulate for content parsing.
+                        line_buffer += raw_chunk
+                        while b"\n" in line_buffer:
+                            line_bytes, line_buffer = (
+                                line_buffer.split(b"\n", 1)
                             )
-                            if delta:
-                                collected_parts.append(delta)
-                        except (json.JSONDecodeError, IndexError):
-                            pass
+                            line = line_bytes.decode(
+                                "utf-8", errors="replace"
+                            ).strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                continue
+                            try:
+                                obj = json.loads(data_str)
+                                delta = (
+                                    obj.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                                if delta:
+                                    collected_parts.append(delta)
+                            except (json.JSONDecodeError, IndexError):
+                                pass
         except Exception as exc:
             logger.error(
                 "[stream] upstream error: %s", exc,
@@ -302,7 +330,7 @@ async def chat_completions(request: Request) -> Any:
 
     body: dict[str, Any] = await request.json()
     messages: list[dict[str, Any]] = body.get("messages", [])
-    session_id = _resolve_session_id(body)
+    session_id = _resolve_session_id(body, request)
     is_stream = body.get("stream", False)
 
     user_text = _last_user_text(messages)
@@ -402,7 +430,7 @@ async def experience_stats() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Basic health check."""
-    return {"status": "ok", "service": "training-free-grpo"}
+    return {"status": "ok", "service": "exploop"}
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +439,7 @@ async def health() -> dict[str, str]:
 
 if __name__ == "__main__":
     uvicorn.run(
-        "openclaw_tf_server:app",
+        "exploop_server:app",
         host="0.0.0.0",
         port=PORT,
         log_level="info",

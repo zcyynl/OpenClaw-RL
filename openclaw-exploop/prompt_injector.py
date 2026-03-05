@@ -4,6 +4,8 @@ PromptInjector — retrieve past experiences and inject them into prompts.
 Works with :class:`ExperienceStore` to look up relevant hints and
 prepend them to the system message so the upstream LLM can benefit
 from accumulated experience without any parameter updates.
+
+Part of the **openclaw-exploop** project (training-free experience loop).
 """
 
 from __future__ import annotations
@@ -57,7 +59,13 @@ class PromptInjector:
         2. Format them into a prefix string (respecting char budget).
         3. Prepend the prefix to the first system message's content.
            If no system message exists, create one at position 0.
+
+        If *query* is empty no retrieval is attempted and the original
+        messages are returned as-is (shallow copy).
         """
+        if not query.strip():
+            return list(messages)
+
         experiences = self._store.retrieve(query, top_k=top_k)
         if not experiences:
             return list(messages)  # shallow copy, nothing to inject
@@ -100,6 +108,9 @@ class PromptInjector:
 
         Returns *text* prefixed with the experience block (if any).
         """
+        if not query.strip():
+            return text
+
         experiences = self._store.retrieve(query, top_k=top_k)
         if not experiences:
             return text
@@ -127,8 +138,19 @@ class PromptInjector:
         experiences: list[dict[str, Any]],
     ) -> str:
         """Format experiences into a prompt prefix within char budget."""
-        lines: list[str] = ["=== Relevant Past Experiences ==="]
-        budget = self._max_exp_chars - len(lines[0]) - 120  # footer
+        header = "=== Relevant Past Experiences ==="
+        footer_line1 = "================================"
+        footer_line2 = (
+            "Use the above experiences as context to improve "
+            "your response."
+        )
+        # Reserve space for header, footer, and newlines between them.
+        reserved = len(header) + len(footer_line1) + len(footer_line2) + 4
+        budget = self._max_exp_chars - reserved
+        if budget <= 0:
+            return ""
+
+        lines: list[str] = [header]
         count = 0
 
         for exp in experiences:
@@ -143,9 +165,6 @@ class PromptInjector:
         if count == 0:
             return ""
 
-        lines.append("================================")
-        lines.append(
-            "Use the above experiences as context to improve "
-            "your response."
-        )
+        lines.append(footer_line1)
+        lines.append(footer_line2)
         return "\n".join(lines)

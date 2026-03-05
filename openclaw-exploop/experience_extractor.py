@@ -2,8 +2,11 @@
 ExperienceExtractor — extract improvement hints from conversation pairs.
 
 Uses a Judge LLM (via OpenAI-compatible API) to infer what was lacking in
-an assistant response based on the *next* user message.  This replicates
-the OPD hint-extraction logic without any model-parameter dependencies.
+an assistant response based on the *next* user message.  This is the core
+of the **ExpLoop** approach: surface quality signals from conversation
+flow without any parameter updates.
+
+Part of the **openclaw-exploop** project (training-free experience loop).
 """
 
 from __future__ import annotations
@@ -139,10 +142,22 @@ class ExperienceExtractor:
         """Call the Judge LLM and return an improvement hint, or *None*.
 
         Returns *None* when:
+        - both inputs are empty / whitespace-only (nothing to analyse)
         - the judge says NO_HINT
         - the resulting hint is trivially short or empty
         - an HTTP / parsing error occurs (logged, not raised)
         """
+        # BUG FIX: guard against empty inputs — the Judge LLM would
+        # produce garbage or hallucinated hints when both fields are
+        # blank.
+        if not response_text.strip() and not next_user_message.strip():
+            logger.debug(
+                "[ExperienceExtractor] both inputs empty for "
+                "session=%s — skipping",
+                session_id,
+            )
+            return None
+
         user_content = _build_user_content(
             response_text, next_user_message,
         )

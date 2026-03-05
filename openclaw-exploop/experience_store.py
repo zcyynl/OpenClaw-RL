@@ -3,6 +3,8 @@ ExperienceStore — keyword-based experience persistence and retrieval.
 
 Stores hints extracted by the Judge LLM and retrieves them via simple
 keyword matching.  Thread-safe; persists to a single JSON file.
+
+Part of the **openclaw-exploop** project (training-free experience loop).
 """
 
 from __future__ import annotations
@@ -104,7 +106,9 @@ class ExperienceStore:
         """Persist current experiences to disk (caller must hold ``_lock``)."""
         tmp_path = self._store_path + ".tmp"
         try:
-            os.makedirs(os.path.dirname(self._store_path) or ".", exist_ok=True)
+            parent = os.path.dirname(self._store_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(self._experiences, fh, ensure_ascii=False, indent=2)
             os.replace(tmp_path, self._store_path)
